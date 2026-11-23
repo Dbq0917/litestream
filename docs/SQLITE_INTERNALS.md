@@ -117,6 +117,8 @@ These distinctions come from [SQLite's checkpoint API](https://sqlite.org/c3ref/
 
 `DB.checkpointIfNeeded` uses PASSIVE for routine thresholds and intervals. At the emergency truncate threshold it first attempts PASSIVE, then may use blocking TRUNCATE; the executor coordinates the required sync and snapshot boundary. Read that function and `checkpointWithExecutor` for current policy. The automatic policy does not use RESTART. The public `DB.Checkpoint` takes a context and mode.
 
+Checkpoint timing also follows replica progress. While a monitored replica is behind, routine checkpoints are deferred and explicit checkpoints wait for the captured TXID to be uploaded. The emergency truncate threshold bounds that wait: reaching it permits the checkpoint and its boundary snapshot, so a slow or failed replica cannot cause unmanaged WAL growth. Checkpoints are not gated when no replica monitor is running.
+
 ## Driver and pragma scope
 
 Production opens `database/sql` with driver name `sqlite`. `DB.init` uses repeated `_pragma` parameters for `busy_timeout(...)` and `wal_autocheckpoint(0)`, sets persistent WAL through the driver connection, enables WAL, and checks the returned mode. Tests and `litestream-test` also use the distinct mattn `sqlite3` driver. Their DSN options and error types are not interchangeable.

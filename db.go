@@ -43,6 +43,10 @@ const (
 	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
 	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
 	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
+
+	// replicaCheckpointPollInterval is how often a checkpoint checks whether
+	// the replica has consumed the captured WAL.
+	replicaCheckpointPollInterval = 100 * time.Millisecond
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -1512,6 +1516,16 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 		exec.state.truncatePassiveFailed = false
 	}
 
+	// Do not recycle WAL frames that the replica has not consumed yet. The
+	// emergency truncate threshold remains the backstop so a slow or failed
+	// replica cannot grow the WAL without bound.
+	if db.replicaCheckpointPending(exec.pos.TXID) && !db.exceedsTruncateThreshold(origWALSize) {
+		db.Logger.Debug("checkpoint deferred until replica catches up",
+			"db_txid", exec.pos.TXID,
+			"replica_txid", db.Replica.Pos().TXID)
+		return nil
+	}
+
 	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
 	// This prevents unbounded WAL growth from long-lived read transactions.
 	if db.exceedsTruncateThreshold(origWALSize) {
@@ -1591,6 +1605,63 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	}
 
 	return nil
+}
+
+// replicaCheckpointPending reports whether the replica is behind the local
+// capture position and can make progress. When replication is disabled or the
+// caller manages replica sync explicitly, checkpoints are not coupled to it.
+func (db *DB) replicaCheckpointPending(target ltx.TXID) bool {
+	r := db.Replica
+	if r == nil || r.Client == nil || !r.MonitorEnabled || target == 0 {
+		return false
+	}
+	// Shutdown stops the monitor before the final sync, so waiting for it
+	// would only block checkpointing until the WAL hits the emergency limit.
+	if db.ctx != nil && db.ctx.Err() != nil {
+		return false
+	}
+	return r.Pos().TXID < target
+}
+
+// waitForReplicaCheckpoint waits until the replica has uploaded the given
+// local position. The wait stops when the WAL reaches the emergency truncate
+// threshold so checkpointing can still bound WAL growth.
+func (db *DB) waitForReplicaCheckpoint(ctx context.Context, target ltx.TXID) error {
+	if !db.replicaCheckpointPending(target) {
+		return nil
+	}
+
+	r := db.Replica
+	db.Logger.Debug("checkpoint waiting for replica",
+		"db_txid", target,
+		"replica_txid", r.Pos().TXID)
+
+	ticker := time.NewTicker(replicaCheckpointPollInterval)
+	defer ticker.Stop()
+
+	for {
+		if r.Pos().TXID >= target {
+			db.Logger.Debug("replica caught up, continuing checkpoint",
+				"replica_txid", r.Pos().TXID)
+			return nil
+		}
+
+		// Stop waiting if the WAL has grown to the emergency threshold. The
+		// checkpoint will take a boundary snapshot to preserve continuity.
+		if walSize, err := db.walFileSize(); err == nil && db.exceedsTruncateThreshold(walSize) {
+			db.Logger.Info("checkpoint proceeding before replica catches up",
+				"db_txid", target,
+				"replica_txid", r.Pos().TXID,
+				"wal_size", walSize)
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-ticker.C:
+		}
+	}
 }
 
 // exceedsTruncateThreshold returns true once walSize has grown past the
@@ -2657,6 +2728,15 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	exec.applySyncResult(result)
 
+	// A checkpoint can recycle or truncate WAL frames the replica may still be
+	// reading. Let the replica finish uploading the captured position first,
+	// unless the WAL has reached the emergency threshold.
+	if checkpointRequiresReplicaDrain(mode) {
+		if err := db.waitForReplicaCheckpoint(ctx, exec.pos.TXID); err != nil {
+			return false, fmt.Errorf("wait for replica checkpoint: %w", err)
+		}
+	}
+
 	var barrierTx *sql.Tx
 	if mode == CheckpointModePassive {
 		barrierTx, err = db.db.BeginTx(ctx, nil)
@@ -2798,6 +2878,17 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 
 	exec.state.syncedSinceCheckpoint = false
 	return true, nil
+}
+
+// checkpointRequiresReplicaDrain reports whether a checkpoint mode can recycle,
+// restart, or truncate WAL frames.
+func checkpointRequiresReplicaDrain(mode string) bool {
+	switch mode {
+	case CheckpointModePassive, CheckpointModeFull, CheckpointModeRestart, CheckpointModeTruncate:
+		return true
+	default:
+		return false
+	}
 }
 
 // execCheckpoint issues a wal_checkpoint PRAGMA in the given mode and returns

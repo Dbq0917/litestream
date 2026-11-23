@@ -85,6 +85,8 @@ The diagram shows the successful replication startup path. A configured restore 
 
 The long-running read transaction prevents outside checkpoints from invalidating WAL data Litestream still needs. Other SQLite connections can continue writing. `DB.Checkpoint(ctx, mode)` coordinates under the executor semaphore. Checkpoint work skips a pass if a snapshot holds the checkpoint lock. The checkpoint path coordinates the read transaction, captures any required WAL data, and updates the sync state when the WAL restarts. See [`db.go`](../db.go).
 
+When a monitored replica is behind the local capture position, automatic checkpoints are deferred so WAL frames are not recycled before they are uploaded. An explicit checkpoint waits for the replica to reach the captured TXID. The wait is bounded by the emergency truncate threshold; once the WAL reaches that size, the checkpoint proceeds and takes its boundary snapshot rather than allowing unbounded WAL growth. Replicas without a running monitor are not coupled to checkpoint progress. See [`db.go`](../db.go).
+
 The optional replica monitor uploads L0 files. It waits on the DB notification channel when caught up, and uses a timer for pacing and idle checks. Replica syncs use their own semaphore. Both background monitors apply rate-limited logging and exponential backoff on failures. See [`replica.go`](../replica.go) and [`db.go`](../db.go).
 
 ## Position and Restore
